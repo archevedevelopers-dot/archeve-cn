@@ -1,0 +1,26 @@
+# Render Blueprint — GCN250 Curve Number API.
+# New → Blueprint → connect a repo containing this cn/ folder (rootDir = cn).
+#
+# The app fetches the 640 MB GCN250 raster from figshare on first boot — no manual
+# upload. The 1 GB disk below caches it at /data so it isn't re-downloaded on every
+# restart. (Free tier has no persistent disk: drop the `disk:` block and set
+# GCN250_PATH=/tmp/GCN250_ARCII.tif — it will re-download on cold starts.)
+services:
+  - type: web
+    name: archeve-cn-gcn250
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: gcn250-cache
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: "8810"
+      - key: GCN250_PATH
+        value: /data/GCN250_ARCII.tif
