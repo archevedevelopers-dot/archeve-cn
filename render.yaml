@@ -17,7 +17,6 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
-      - key: PORT
-        value: "8810"
+      # PORT is injected by Render — don't override it
       - key: GCN250_PATH
         value: /tmp/GCN250_ARCII.tif

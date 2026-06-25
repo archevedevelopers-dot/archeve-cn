@@ -9,6 +9,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# rasterio's bundled GDAL still needs libexpat at runtime (not in python:3.11-slim)
+RUN apt-get update && apt-get install -y --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # rasterio ships manylinux wheels with GDAL bundled — no system GDAL/compiler needed
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt fastapi "uvicorn[standard]"
