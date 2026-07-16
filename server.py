@@ -86,6 +86,21 @@ def gcn(req: Req):
     return res
 
 
+@app.post("/datapack")
+def datapack(req: Req):
+    """Site polygon -> zip of SCS-CN GeoTIFFs (CN, retention S, initial abstraction Ia)."""
+    from fastapi.responses import FileResponse
+    import datapack as dp
+    geom = _extract_geom(req)
+    if not geom:
+        raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
+    zip_path, meta = dp.build(geom)
+    if zip_path is None:
+        raise HTTPException(status_code=422, detail=meta.get("error", "data pack failed"))
+    return FileResponse(zip_path, media_type="application/zip", filename="archeve_site_datapack.zip",
+                        headers={"X-Datapack-Meta": str(meta)})
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8810)))
