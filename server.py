@@ -45,6 +45,7 @@ class Req(BaseModel):
     geometry: Optional[dict] = None
     type: Optional[str] = None
     features: Optional[list] = None
+    premium: Optional[bool] = False
 
 
 def _extract_geom(req: Req):
@@ -94,7 +95,7 @@ def datapack(req: Req):
     geom = _extract_geom(req)
     if not geom:
         raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
-    zip_path, meta = dp.build(geom)
+    zip_path, meta = dp.build(geom, premium=bool(req.premium))
     if zip_path is None:
         raise HTTPException(status_code=422, detail=meta.get("error", "data pack failed"))
     return FileResponse(zip_path, media_type="application/zip", filename="archeve_site_datapack.zip",
