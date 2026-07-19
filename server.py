@@ -90,12 +90,19 @@ def gcn(req: Req):
 @app.post("/datapack")
 def datapack(req: Req):
     """Site polygon -> zip of SCS-CN GeoTIFFs (CN, retention S, initial abstraction Ia)."""
+    import traceback
     from fastapi.responses import FileResponse
     import datapack as dp
     geom = _extract_geom(req)
     if not geom:
         raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
-    zip_path, meta = dp.build(geom, premium=bool(req.premium))
+    try:
+        zip_path, meta = dp.build(geom, premium=bool(req.premium))
+    except Exception as ex:  # surface the real cause instead of an opaque 500
+        tb = traceback.format_exc()
+        print("[datapack] build crashed:\n" + tb, flush=True)
+        raise HTTPException(status_code=500, detail="datapack build error: %s: %s"
+                            % (type(ex).__name__, ex))
     if zip_path is None:
         raise HTTPException(status_code=422, detail=meta.get("error", "data pack failed"))
     return FileResponse(zip_path, media_type="application/zip", filename="archeve_site_datapack.zip",

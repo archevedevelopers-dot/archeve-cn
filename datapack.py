@@ -22,6 +22,7 @@ import os
 import zipfile
 import tempfile
 import math
+import traceback
 import urllib.request
 
 import numpy as np
