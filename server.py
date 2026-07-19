@@ -48,6 +48,17 @@ class Req(BaseModel):
     premium: Optional[bool] = False
 
 
+# ── Stripe (premium water-level map) config ──────────────────────────────────
+# STRIPE_SECRET_KEY is set on the host (never in code). Without it, the paid
+# endpoints return 503 and the free data pack is unaffected.
+STRIPE_KEY = os.environ.get("STRIPE_SECRET_KEY")
+PREMIUM_PRICE_CENTS = int(os.environ.get("DATAPACK_PREMIUM_CENTS", "1000"))  # $10.00
+SUCCESS_URL = os.environ.get(
+    "DATAPACK_SUCCESS_URL", "https://aip.archeve.in/tool/flood-screening.html")
+CANCEL_URL = os.environ.get("DATAPACK_CANCEL_URL", SUCCESS_URL)
+PREMIUM_DIR = os.environ.get("DATAPACK_PREMIUM_DIR", "/tmp/archeve_premium")
+
+
 def _extract_geom(req: Req):
     if req.geometry:
         return req.geometry
@@ -107,6 +118,103 @@ def datapack(req: Req):
         raise HTTPException(status_code=422, detail=meta.get("error", "data pack failed"))
     return FileResponse(zip_path, media_type="application/zip", filename="archeve_site_datapack.zip",
                         headers={"X-Datapack-Meta": str(meta)})
+
+
+@app.post("/datapack/checkout")
+def datapack_checkout(req: Req):
+    """Build the premium pack; if a water-level layer is actually available for
+    this site, open a $10 Stripe Checkout for it and stash the built pack under a
+    token so it can be served after payment. Returns {available, checkout_url|reason}."""
+    import json
+    import secrets
+    import shutil
+    import traceback
+    import datapack as dp
+    if not STRIPE_KEY:
+        raise HTTPException(status_code=503, detail="Payments are not configured yet.")
+    geom = _extract_geom(req)
+    if not geom:
+        raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
+    try:
+        zip_path, meta = dp.build(geom, premium=True)
+    except Exception as ex:
+        print("[checkout] build crashed:\n" + traceback.format_exc(), flush=True)
+        raise HTTPException(status_code=500, detail="datapack build error: %s: %s"
+                            % (type(ex).__name__, ex))
+    if zip_path is None:
+        raise HTTPException(status_code=422, detail=meta.get("error", "data pack failed"))
+    if not meta.get("premium"):
+        # inland / no coastal flood reaches the site — never sell an empty layer
+        return {"available": False,
+                "reason": "No coastal flood reaches this site — the water-level map is a "
+                          "coastal product and does not apply to an inland location."}
+    # stash geometry + the built pack under a random token
+    os.makedirs(PREMIUM_DIR, exist_ok=True)
+    token = secrets.token_urlsafe(16)
+    with open(os.path.join(PREMIUM_DIR, token + ".json"), "w") as f:
+        json.dump(geom, f)
+    shutil.copy(zip_path, os.path.join(PREMIUM_DIR, token + ".zip"))
+
+    import stripe
+    stripe.api_key = STRIPE_KEY
+    sep = "&" if "?" in SUCCESS_URL else "?"
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{
+                "quantity": 1,
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": PREMIUM_PRICE_CENTS,
+                    "product_data": {
+                        "name": "Archeve — Site Water-Level Map (WSE)",
+                        "description": "Approx coastal water-surface elevation clipped to your "
+                                       "site, 30 m GeoTIFF (EPSG:4326).",
+                    },
+                },
+            }],
+            metadata={"token": token},
+            success_url=SUCCESS_URL + sep + "premium_token=" + token + "&session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=CANCEL_URL,
+        )
+    except Exception as ex:
+        print("[checkout] stripe error: %s" % ex, flush=True)
+        raise HTTPException(status_code=502, detail="Could not open checkout: %s" % ex)
+    return {"available": True, "checkout_url": session.url,
+            "price_usd": PREMIUM_PRICE_CENTS / 100.0}
+
+
+@app.get("/datapack/premium")
+def datapack_premium(token: str, session_id: str):
+    """Serve the paid water-level pack — only after Stripe confirms the session is paid."""
+    import json
+    from fastapi.responses import FileResponse
+    if not STRIPE_KEY:
+        raise HTTPException(status_code=503, detail="Payments are not configured yet.")
+    import stripe
+    stripe.api_key = STRIPE_KEY
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except Exception as ex:
+        raise HTTPException(status_code=400, detail="Could not verify payment: %s" % ex)
+    if session.get("payment_status") != "paid":
+        raise HTTPException(status_code=402, detail="Payment not completed.")
+    if (session.get("metadata") or {}).get("token") != token:
+        raise HTTPException(status_code=403, detail="Token does not match this payment.")
+    zpath = os.path.join(PREMIUM_DIR, token + ".zip")
+    if not os.path.exists(zpath):
+        # container recycled between checkout and return — rebuild from stored geometry
+        gpath = os.path.join(PREMIUM_DIR, token + ".json")
+        if not os.path.exists(gpath):
+            raise HTTPException(status_code=410,
+                                detail="This purchase expired — email info@archeve.in with your receipt.")
+        import datapack as dp
+        zpath, meta = dp.build(json.load(open(gpath)), premium=True)
+        if zpath is None:
+            raise HTTPException(status_code=500,
+                                detail="Rebuild failed — email info@archeve.in with your receipt.")
+    return FileResponse(zpath, media_type="application/zip",
+                        filename="archeve_site_datapack_premium.zip")
 
 
 if __name__ == "__main__":

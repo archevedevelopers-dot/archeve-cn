@@ -186,20 +186,26 @@ def build(geom, path=None, premium=False):
         add("mannings_n.tif", mann)
 
     # ── flood depth (fetch) -> hazard + water level ──
+    # Only ship the coastal-flood layers where water actually reaches the site.
+    # An inland site has no coastal flood, so an empty hazard / water-level raster
+    # would mislead — and the premium water-level layer must never be sold empty.
+    premium_delivered = False
     depth_res = _fetch_flood_depth(*bounds)
     if depth_res is not None:
         d_arr, d_tf, d_crs = depth_res
         depth = _reproject_to(d_arr, d_tf, d_crs, dst_tf, dst_shape, crs, Resampling.bilinear, src_nodata=-9999.0)
-        wet = np.isfinite(depth) & (depth > 0)
-        haz = np.full(dst_shape, NODATA_F, dtype="float32")
-        haz[wet & (depth <= 0.3)] = 1
-        haz[wet & (depth > 0.3) & (depth <= 0.6)] = 2
-        haz[wet & (depth > 0.6) & (depth <= 1.2)] = 3
-        haz[wet & (depth > 1.2)] = 4
-        add("flood_hazard.tif", haz)
-        if premium and dem_grid is not None:
-            wse = np.where(wet, dem_grid + depth, NODATA_F)
-            add("water_level_wse.tif", wse)
+        wet = np.isfinite(depth) & (depth > 0) & inside
+        if wet.any():
+            haz = np.full(dst_shape, NODATA_F, dtype="float32")
+            haz[wet & (depth <= 0.3)] = 1
+            haz[wet & (depth > 0.3) & (depth <= 0.6)] = 2
+            haz[wet & (depth > 0.6) & (depth <= 1.2)] = 3
+            haz[wet & (depth > 1.2)] = 4
+            add("flood_hazard.tif", haz)
+            if premium and dem_grid is not None:
+                wse = np.where(wet, dem_grid + depth, NODATA_F)
+                add("water_level_wse.tif", wse)
+                premium_delivered = True
 
     # ── write + zip ──
     tmpdir = tempfile.mkdtemp(prefix="datapack_")
@@ -229,5 +235,7 @@ def build(geom, path=None, premium=False):
         for name in list(layers) + ["README.txt"]:
             z.write(os.path.join(tmpdir, name), name)
 
-    return zip_path, {"ok": True, "layers": produced, "premium": bool(premium and "water_level_wse.tif" in layers),
+    return zip_path, {"ok": True, "layers": produced,
+                      "premium": premium_delivered,                 # water-level actually delivered
+                      "coastal": "flood_hazard.tif" in layers,      # site reached by coastal flood -> premium applies
                       "grid": "EPSG:4326 ~30 m" if dem_grid is not None else "EPSG:4326 ~250 m (DEM unavailable)"}
