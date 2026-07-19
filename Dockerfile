@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libexpat1 \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt fastapi "uvicorn[standard]"
 
-COPY gcn_zonal.py server.py ./
+COPY gcn_zonal.py datapack.py server.py ./
 
 ENV PORT=8810
 ENV GCN250_PATH=/tmp/GCN250_ARCII.tif
