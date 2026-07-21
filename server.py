@@ -46,6 +46,7 @@ class Req(BaseModel):
     type: Optional[str] = None
     features: Optional[list] = None
     premium: Optional[bool] = False
+    return_url: Optional[str] = None
 
 
 # ── Stripe (premium water-level map) config ──────────────────────────────────
@@ -53,10 +54,20 @@ class Req(BaseModel):
 # endpoints return 503 and the free data pack is unaffected.
 STRIPE_KEY = os.environ.get("STRIPE_SECRET_KEY")
 PREMIUM_PRICE_CENTS = int(os.environ.get("DATAPACK_PREMIUM_CENTS", "1000"))  # $10.00
-SUCCESS_URL = os.environ.get(
-    "DATAPACK_SUCCESS_URL", "https://aip.archeve.in/tool/flood-screening.html")
+SUCCESS_URL = os.environ.get("DATAPACK_SUCCESS_URL", "https://aip.archeve.in/aip")
 CANCEL_URL = os.environ.get("DATAPACK_CANCEL_URL", SUCCESS_URL)
 PREMIUM_DIR = os.environ.get("DATAPACK_PREMIUM_DIR", "/tmp/archeve_premium")
+
+# A caller may ask to be returned to the page it started from, but only to one of
+# our own origins — an unchecked return_url would make this an open redirect.
+_ALLOWED_RETURN_PREFIXES = ("https://aip.archeve.in/", "https://archeve.in/",
+                            "https://www.archeve.in/")
+
+
+def _safe_return_url(candidate: Optional[str]) -> str:
+    if candidate and candidate.startswith(_ALLOWED_RETURN_PREFIXES):
+        return candidate.split("#")[0]
+    return SUCCESS_URL
 
 
 def _extract_geom(req: Req):
@@ -157,7 +168,8 @@ def datapack_checkout(req: Req):
 
     import stripe
     stripe.api_key = STRIPE_KEY
-    sep = "&" if "?" in SUCCESS_URL else "?"
+    ret = _safe_return_url(req.return_url)
+    sep = "&" if "?" in ret else "?"
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
@@ -174,8 +186,8 @@ def datapack_checkout(req: Req):
                 },
             }],
             metadata={"token": token},
-            success_url=SUCCESS_URL + sep + "premium_token=" + token + "&session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=CANCEL_URL,
+            success_url=ret + sep + "premium_token=" + token + "&session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=ret,
         )
     except Exception as ex:
         print("[checkout] stripe error: %s" % ex, flush=True)
