@@ -17,6 +17,7 @@ so this stays fast even on the global raster.
 """
 import os
 import math
+import threading
 
 import numpy as np
 import rasterio
@@ -31,25 +32,53 @@ NODATA = 255
 MAX_DEG = 1.0  # ~110 km bbox guard — screening scale
 
 _ensured = False
+_fetch_lock = threading.Lock()
 
 
 def ensure_raster():
-    """Download GCN250 to GCN250_PATH if absent and a URL is configured. Idempotent.
-    Streams to a .part file then renames, so a partial download is never used."""
+    """Download GCN250 to GCN250_PATH if absent and a URL is configured. Idempotent
+    and concurrency-safe.
+
+    Two hazards this guards against, both previously live:
+      * Concurrent callers (the startup prefetch thread and an early request) each
+        started a 640 MB download into the SAME fixed '.part' file, interleaving
+        writes and renaming a corrupted raster into place. A lock plus a
+        process/thread-unique temp name removes that.
+      * A non-raster response (figshare HTML error/redirect page) was renamed to
+        .tif and cached, and because _ensured was then set the service never
+        retried — every later CN call failed with an opaque rasterio error. The
+        download is now validated by opening it before it is promoted.
+    """
     global _ensured
     if _ensured or os.path.exists(GCN250_PATH):
-        _ensured = True
-        return os.path.exists(GCN250_PATH)
+        _ensured = os.path.exists(GCN250_PATH)
+        return _ensured
     if not GCN250_URL:
         return False
     import urllib.request
     import shutil
-    tmp = GCN250_PATH + ".part"
-    os.makedirs(os.path.dirname(GCN250_PATH) or ".", exist_ok=True)
-    req = urllib.request.Request(GCN250_URL, headers={"User-Agent": "archeve-cn/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
-        shutil.copyfileobj(r, f, length=1024 * 1024)
-    os.replace(tmp, GCN250_PATH)
+    with _fetch_lock:
+        # re-check inside the lock: another thread may have completed the fetch
+        if os.path.exists(GCN250_PATH):
+            _ensured = True
+            return True
+        os.makedirs(os.path.dirname(GCN250_PATH) or ".", exist_ok=True)
+        tmp = "%s.%d.%d.part" % (GCN250_PATH, os.getpid(), threading.get_ident())
+        req = urllib.request.Request(GCN250_URL, headers={"User-Agent": "archeve-cn/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f, length=1024 * 1024)
+            # validate before promoting — never cache an HTML error page as the raster
+            with rasterio.open(tmp) as probe:
+                if probe.count < 1:
+                    raise ValueError("downloaded file has no raster band")
+            os.replace(tmp, GCN250_PATH)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise          # leave _ensured False so a later call retries
     _ensured = True
     return True
 
@@ -99,7 +128,11 @@ def zonal_cn(geom, path=None):
                     cn2 = float(v)
                     cn1, cn3 = _amc(cn2)
                     return {"ok": True, "CN_II": round(cn2, 1), "CN_I": cn1, "CN_III": cn3,
-                            "n_pixels": 1, "method": "centroid pixel (polygon < 250 m)",
+                            "cn_deciles": [round(cn2, 1)], "cn_sd": 0.0, "heterogeneous": False,
+                            "n_pixels": 1, "small_sample": True,
+                            "cn_min": int(cn2), "cn_max": int(cn2),
+                            "method": ("single centroid pixel — the polygon is smaller than one "
+                                       "250 m GCN250 cell, so CN is a point sample, not a parcel mean"),
                             "source": "GCN250 (Jaafar et al. 2019), ARC II, 250 m"}
             except Exception:
                 pass
@@ -107,16 +140,42 @@ def zonal_cn(geom, path=None):
 
         cn2 = float(valid.mean())
         cn1, cn3 = _amc(cn2)
-        res = ds.res  # degrees/pixel
-        meanlat = (miny + maxy) / 2.0
-        px_km2 = (res[0] * 111.32 * math.cos(math.radians(meanlat))) * (res[1] * 110.57)
+
+        # Pixel ground area. GCN250 is EPSG:4326, so ds.res is in DEGREES and must be
+        # converted; a projected raster would already be in metres. Check rather than
+        # assume — silently treating metres as degrees would inflate area ~1e5x.
+        res = ds.res
+        if ds.crs is not None and ds.crs.is_geographic:
+            meanlat = (miny + maxy) / 2.0
+            px_km2 = (res[0] * 111.32 * math.cos(math.radians(meanlat))) * (res[1] * 110.57)
+            grid_note = "geographic grid (deg), area via local metric scaling"
+        else:
+            px_km2 = (res[0] * res[1]) / 1.0e6          # projected: linear units assumed metres
+            grid_note = "projected grid, area from linear units"
+
+        # ── CN distribution, so the caller can weight RUNOFF instead of CN ──
+        # SCS-CN runoff is strongly non-linear in CN, so Q(mean CN) != mean Q(CN).
+        # NEH-4 / TR-55 are explicit that markedly different covers must be combined by
+        # weighting the RUNOFF, not by averaging the curve number. On a mixed parcel the
+        # composite-CN shortcut under-predicts runoff badly (verified: -59% for a 98/45
+        # urban-desert mix, -87% for sand/pavement at a 60 mm storm). Ten equal-area
+        # quantile mid-points reproduce the true area-mean runoff to <0.01%, so they are
+        # returned and the engine integrates runoff across them.
+        deciles = [round(float(v), 1) for v in np.percentile(valid, np.arange(5, 100, 10))]
+        cn_sd = float(valid.std())
         return {
             "ok": True,
             "CN_II": round(cn2, 1), "CN_I": cn1, "CN_III": cn3,
+            "cn_deciles": deciles,
+            "cn_sd": round(cn_sd, 2),
+            "heterogeneous": bool(cn_sd > 8.0),
             "n_pixels": int(valid.size),
+            "small_sample": bool(valid.size < 5),
             "area_km2": round(valid.size * px_km2, 3),
             "cn_min": int(valid.min()), "cn_max": int(valid.max()),
-            "method": "area-weighted mean of GCN250 pixels within the polygon",
+            "method": ("arithmetic mean of GCN250 pixels whose centre falls inside the polygon "
+                       "(no partial-pixel weighting); cn_deciles provided for runoff-weighted "
+                       "compositing — " + grid_note),
             "source": "GCN250 global gridded Curve Number (Jaafar, Ahmad & El Beyrouthy 2019), ARC II, 250 m",
         }
 
