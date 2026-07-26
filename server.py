@@ -27,6 +27,7 @@ from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 from typing import Any, Optional  # noqa: E402
+from shapely.geometry import shape, mapping  # noqa: E402
 
 app = FastAPI(title="Archeve GCN250 Curve Number", version="1.0")
 
@@ -70,6 +71,57 @@ def _safe_return_url(candidate: Optional[str]) -> str:
     return SUCCESS_URL
 
 
+# Upper bound on ring complexity. The MAX_DEG bbox guard does not catch this: a 200 000-vertex
+# ring can sit inside a 0.002 deg box, pass every size check, and then be rasterised. Real site
+# boundaries are hundreds of vertices at most.
+MAX_VERTICES = int(os.environ.get("MAX_GEOM_VERTICES", "20000"))
+
+
+def _count_vertices(geom: dict) -> int:
+    """Total coordinate pairs in a GeoJSON geometry, at any nesting depth."""
+    def walk(x):
+        if not isinstance(x, (list, tuple)) or not x:
+            return 0
+        if isinstance(x[0], (int, float)):     # a single [x, y] position
+            return 1
+        return sum(walk(i) for i in x)
+    return walk(geom.get("coordinates") or [])
+
+
+def _validated_geom(req: Req) -> dict:
+    """Extract, bound and repair the request geometry, or raise HTTPException.
+
+    Self-intersecting rings are common in exported KML and are NOT rejected by shapely —
+    a bow-tie silently reports zero area and masks the wrong cells, so it is repaired with
+    buffer(0) rather than trusted or refused.
+    """
+    geom = _extract_geom(req)
+    if not geom:
+        raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
+    if not isinstance(geom, dict) or not geom.get("type"):
+        raise HTTPException(status_code=400, detail="Geometry must be a GeoJSON geometry object.")
+    n = _count_vertices(geom)
+    if n == 0:
+        raise HTTPException(status_code=400, detail="Geometry has no coordinates.")
+    if n > MAX_VERTICES:
+        raise HTTPException(status_code=413,
+                            detail="Geometry has %d vertices (limit %d) — simplify the boundary."
+                                   % (n, MAX_VERTICES))
+    try:
+        g = shape(geom)
+    except Exception as ex:
+        raise HTTPException(status_code=400, detail="Unreadable geometry: %s" % ex)
+    if g.is_empty:
+        raise HTTPException(status_code=400, detail="Geometry is empty.")
+    if not g.is_valid:
+        repaired = g.buffer(0)
+        if repaired.is_empty or not repaired.is_valid:
+            raise HTTPException(status_code=422,
+                                detail="Geometry is self-intersecting and could not be repaired.")
+        return mapping(repaired)
+    return geom
+
+
 def _extract_geom(req: Req):
     if req.geometry:
         return req.geometry
@@ -100,9 +152,7 @@ def health():
 
 @app.post("/gcn")
 def gcn(req: Req):
-    geom = _extract_geom(req)
-    if not geom:
-        raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
+    geom = _validated_geom(req)
     res = gz.zonal_cn(geom)
     if not res.get("ok"):
         raise HTTPException(status_code=422, detail=res.get("error", "zonal CN failed"))
@@ -114,9 +164,7 @@ def slope(req: Req):
     """Polygon -> mean/median terrain slope (%) from the 30 m Copernicus DEM.
     Feeds the screening's Tc/peak flow with a real slope instead of a national default."""
     import datapack as dp
-    geom = _extract_geom(req)
-    if not geom:
-        raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
+    geom = _validated_geom(req)
     res = dp.slope_percent(geom)
     if not res.get("ok"):
         raise HTTPException(status_code=422, detail=res.get("error", "slope failed"))
@@ -129,9 +177,7 @@ def datapack(req: Req):
     import traceback
     from fastapi.responses import FileResponse
     import datapack as dp
-    geom = _extract_geom(req)
-    if not geom:
-        raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
+    geom = _validated_geom(req)
     try:
         zip_path, meta = dp.build(geom, premium=bool(req.premium))
     except Exception as ex:  # surface the real cause instead of an opaque 500
@@ -157,9 +203,7 @@ def datapack_checkout(req: Req):
     import datapack as dp
     if not STRIPE_KEY:
         raise HTTPException(status_code=503, detail="Payments are not configured yet.")
-    geom = _extract_geom(req)
-    if not geom:
-        raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
+    geom = _validated_geom(req)
     try:
         zip_path, meta = dp.build(geom, premium=True)
     except Exception as ex:
