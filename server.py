@@ -109,6 +109,20 @@ def gcn(req: Req):
     return res
 
 
+@app.post("/slope")
+def slope(req: Req):
+    """Polygon -> mean/median terrain slope (%) from the 30 m Copernicus DEM.
+    Feeds the screening's Tc/peak flow with a real slope instead of a national default."""
+    import datapack as dp
+    geom = _extract_geom(req)
+    if not geom:
+        raise HTTPException(status_code=400, detail="No geometry/feature in request body.")
+    res = dp.slope_percent(geom)
+    if not res.get("ok"):
+        raise HTTPException(status_code=422, detail=res.get("error", "slope failed"))
+    return res
+
+
 @app.post("/datapack")
 def datapack(req: Req):
     """Site polygon -> zip of SCS-CN GeoTIFFs (CN, retention S, initial abstraction Ia)."""
