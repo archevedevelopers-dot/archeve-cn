@@ -112,7 +112,8 @@ def _fetch_flood_depth(w, s, e, n):
 
 
 def slope_percent(geom):
-    """Mean/median terrain slope (%) over the polygon, from the 30 m Copernicus DEM.
+    """Median TERRAIN slope (%) over the polygon, from the Copernicus DEM, coarsened to
+    ~120 m so building/canopy facets of the GLO-30 surface model don't inflate it.
     Returns {"ok": True, "slope_pct": float, "n": int, "source": str} or {"ok": False, "error": str}.
     Lets the screening use real parcel slope instead of a national default in Tc/peak-flow."""
     try:
@@ -124,7 +125,7 @@ def slope_percent(geom):
     w, s, e, n = g.bounds
     if (e - w) > MAX_DEG or (n - s) > MAX_DEG:
         return {"ok": False, "error": "bbox too large (> %.1f deg)" % MAX_DEG}
-    pad = 0.003
+    pad = 0.006
     bounds = (w - pad, s - pad, e + pad, n + pad)
     dem, dem_tf = _mosaic(_cop_dem_urls(*bounds), bounds)
     if dem is None:
@@ -134,14 +135,27 @@ def slope_percent(geom):
     lat0 = math.radians((s + n) / 2.0)
     dy = abs(dem_tf.e) * 110540.0
     dx = abs(dem_tf.a) * 111320.0 * math.cos(lat0)
-    gy, gx = np.gradient(dem, dy, dx)              # rows = latitude, cols = longitude
+    # GLO-30 is a SURFACE model (buildings/canopy). A raw 30 m gradient reads building
+    # facets, not terrain — over dense cities that inflates slope 5-10x. Coarsen ~30 m ->
+    # ~120 m (block mean) so buildings wash out and we recover the drainage/terrain slope.
+    k = 4
+    H, W = dem.shape
+    Hc, Wc = H // k, W // k
+    if Hc >= 2 and Wc >= 2:
+        demc = np.nanmean(dem[:Hc * k, :Wc * k].reshape(Hc, k, Wc, k), axis=(1, 3))
+        tf = rasterio.Affine(dem_tf.a * k, dem_tf.b, dem_tf.c, dem_tf.d, dem_tf.e * k, dem_tf.f)
+        cy, cx = dy * k, dx * k
+    else:
+        demc, tf, cy, cx = dem, dem_tf, dy, dx
+    gy, gx = np.gradient(demc, cy, cx)            # rows = latitude, cols = longitude
     slope = np.sqrt(gx * gx + gy * gy)            # m/m
-    mask = geometry_mask([mapping(g)], out_shape=dem.shape, transform=dem_tf, invert=True)
+    mask = geometry_mask([mapping(g)], out_shape=demc.shape, transform=tf, invert=True)
     vals = slope[mask & np.isfinite(slope)]
     if vals.size == 0:
         return {"ok": False, "error": "no DEM pixels under polygon"}
-    return {"ok": True, "slope_pct": round(float(np.median(vals) * 100.0), 3),
-            "n": int(vals.size), "source": "Copernicus GLO-30 (EGM2008)"}
+    slope_pct = min(60.0, float(np.median(vals) * 100.0))   # cap absurd cliff/artifact medians
+    return {"ok": True, "slope_pct": round(slope_pct, 3), "n": int(vals.size),
+            "source": "Copernicus GLO-30, terrain-coarsened ~120 m (EGM2008)"}
 
 
 def build(geom, path=None, premium=False):
