@@ -104,9 +104,10 @@ def _reproject_to(src_arr, src_transform, src_crs, dst_transform, dst_shape, dst
     return dst
 
 
-def _fetch_flood_depth(w, s, e, n):
+def _fetch_flood_depth(w, s, e, n, rp=100, scenario="today"):
     """GeoTIFF depth clip from the flood service; return (arr, transform, crs) or None."""
-    url = "%s/download?bbox=%.4f,%.4f,%.4f,%.4f&rp=100&scenario=today&name=site" % (FLOOD_API, w, s, e, n)
+    url = ("%s/download?bbox=%.4f,%.4f,%.4f,%.4f&rp=%d&scenario=%s&name=site"
+           % (FLOOD_API, w, s, e, n, int(rp), scenario))
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False).name
         req = urllib.request.Request(url, headers={"User-Agent": "archeve-datapack"})
@@ -163,6 +164,134 @@ def slope_percent(geom):
     slope_pct = min(60.0, float(np.median(vals) * 100.0))   # cap absurd cliff/artifact medians
     return {"ok": True, "slope_pct": round(slope_pct, 3), "n": int(vals.size),
             "source": "Copernicus GLO-30, terrain-coarsened ~120 m (EGM2008)"}
+
+
+def _still_water_level(dem, depth, wet):
+    """Estimate the still-water surface elevation (m, DEM datum) from a coarse depth grid.
+
+    A still-water surface is flat, so in principle any wet cell gives the level as
+    DEM + depth. In practice it does not: the Deltares depth is ~1 km and was solved on
+    NASADEM, while the DEM here is 30 m Copernicus GLO-30 — different resolution, different
+    geoid. Inside one 1 km depth cell the 30 m elevations vary by several metres, so
+    DEM + depth inherits the terrain's variance rather than the water's. Measured on a
+    Sundarbans extent: DEM + depth spanned -1.3 to 11.3 m (sd 2.2 m) against a DEM sd of
+    2.15 m, and the median was NON-MONOTONIC in return period (rp10 above rp100) — i.e. the
+    statistic was tracking terrain noise, not the flood.
+
+    Restricting to the deepest decile fixes this: those cells are unambiguously inundated
+    and lie on the low ground where the two terrain models agree most closely. On the same
+    extent that estimator is monotonic in return period (3.998 / 4.218 / 4.465 / 4.612 m for
+    rp 10 / 50 / 100 / 250).
+
+    Returns (level_m, spread_m) or (None, None). `spread` is the interquartile range of
+    DEM + depth over ALL wet cells — an honest indicator of how much the coarse-depth /
+    fine-DEM mismatch is limiting the estimate, not a confidence interval on the flood.
+    """
+    if not wet.any():
+        return None, None
+    dsum = (dem + depth)[wet]
+    dwet = depth[wet]
+    thr = np.percentile(dwet, 90)
+    deep = dsum[dwet >= thr]
+    if deep.size == 0:
+        return None, None
+    level = float(np.median(deep))
+    spread = float(np.percentile(dsum, 75) - np.percentile(dsum, 25))
+    return round(level, 3), round(spread, 3)
+
+
+def terrain(geom, size=96, levels=None, pad_frac=0.6):
+    """Downsampled DEM grid + still-water surface levels, for the 3D view.
+
+    Returns a compact JSON-able payload: a `size` x `size` elevation grid over the parcel
+    (padded outward so the surrounding terrain is visible), plus, for each requested return
+    period / scenario, the STILL-WATER LEVEL in the same vertical datum as the DEM.
+
+    The level is the median of (DEM + coastal depth) over the wet cells — the same
+    still-water plane the premium WSE layer uses — NOT `DEM + depth` per cell, which is not
+    a water surface. `null` means no modelled coastal water reaches this extent at that
+    return period; the viewer must show no water rather than a zero-depth sheet.
+
+    This supports a rising-water-level visualisation only. There is no hydrodynamic
+    solution behind it: no velocity, no wave, no routing, no timing.
+    """
+    try:
+        g = shape(geom)
+    except Exception as ex:
+        return {"ok": False, "error": "bad geometry: %s" % ex}
+    if g.is_empty:
+        return {"ok": False, "error": "empty geometry"}
+    size = max(32, min(160, int(size)))
+    levels = levels or [(10, "today"), (50, "today"), (100, "today"),
+                        (250, "today"), (100, "2050"), (250, "2050")]
+
+    w, s, e, n = g.bounds
+    # pad outward so the parcel sits in visible context, and keep the extent square in
+    # ground distance so the rendered mesh is not stretched
+    cx, cy = (w + e) / 2.0, (s + n) / 2.0
+    half = max((e - w), (n - s) * 1.0) * (0.5 + pad_frac)
+    half = max(half, 0.004)                       # ~450 m floor for very small parcels
+    coslat = max(0.1, math.cos(math.radians(cy)))
+    bounds = (cx - half, cy - half * coslat, cx + half, cy + half * coslat)
+    if (bounds[2] - bounds[0]) > MAX_DEG or (bounds[3] - bounds[1]) > MAX_DEG:
+        return {"ok": False, "error": "extent too large for the 3D view"}
+
+    dem, dem_tf = _mosaic(_cop_dem_urls(*bounds), bounds)
+    if dem is None:
+        return {"ok": False, "error": "DEM unavailable for this extent"}
+    dem = np.where(dem.astype("float32") > -1000, dem.astype("float32"), np.nan)
+
+    # block-mean down to the render grid (keeps it small on the wire and smooths the
+    # building facets of the GLO-30 surface model, as the slope endpoint does)
+    H, W = dem.shape
+    ky, kx = max(1, H // size), max(1, W // size)
+    Hc, Wc = H // ky, W // kx
+    if Hc < 2 or Wc < 2:
+        return {"ok": False, "error": "extent too small for a terrain mesh"}
+    with np.errstate(invalid="ignore"):
+        small = np.nanmean(dem[:Hc * ky, :Wc * kx].reshape(Hc, ky, Wc, kx), axis=(1, 3))
+    grid_tf = rasterio.Affine(dem_tf.a * kx, dem_tf.b, dem_tf.c,
+                              dem_tf.d, dem_tf.e * ky, dem_tf.f)
+
+    # still-water level per requested return period, on the FULL-resolution DEM
+    water = []
+    for rp, scen in levels:
+        lvl = None
+        res = _fetch_flood_depth(bounds[0], bounds[1], bounds[2], bounds[3], rp=rp, scenario=scen)
+        if res is not None:
+            d_arr, d_tf, d_crs = res
+            depth = _reproject_to(d_arr, d_tf, d_crs, dem_tf, dem.shape, "EPSG:4326",
+                                  Resampling.bilinear, src_nodata=-9999.0)
+            wet = np.isfinite(depth) & (depth > 0) & np.isfinite(dem)
+            lvl, spread = _still_water_level(dem, depth, wet)
+            water.append({"rp": rp, "scenario": scen, "level_m": lvl,
+                          "level_spread_m": spread,
+                          "max_depth_m": round(float(np.nanmax(depth[wet])), 2) if wet.any() else None})
+            continue
+        water.append({"rp": rp, "scenario": scen, "level_m": None,
+                      "level_spread_m": None, "max_depth_m": None})
+
+    valid = small[np.isfinite(small)]
+    if valid.size == 0:
+        return {"ok": False, "error": "no valid DEM pixels in this extent"}
+    # NaN is not valid JSON; send the nodata sentinel and let the client mask it
+    out = np.where(np.isfinite(small), np.round(small, 2), NODATA_F)
+    ring = list(g.exterior.coords) if g.geom_type == "Polygon" else []
+    return {
+        "ok": True,
+        "width": int(Wc), "height": int(Hc),
+        "bounds": [round(b, 6) for b in bounds],
+        "cell_deg": [abs(grid_tf.a), abs(grid_tf.e)],
+        "dem": [float(v) for v in out.ravel()],
+        "nodata": NODATA_F,
+        "dem_min": round(float(valid.min()), 2), "dem_max": round(float(valid.max()), 2),
+        "parcel": [[round(c[0], 6), round(c[1], 6)] for c in ring],
+        "water": water,
+        "datum": "EGM2008 orthometric (Copernicus GLO-30)",
+        "source": "Copernicus GLO-30 DEM; still-water levels from Deltares Global Flood Maps (~1 km)",
+        "note": ("Still-water levels only. No hydrodynamic model: no velocity, wave, routing "
+                 "or timing is represented."),
+    }
 
 
 def build(geom, path=None, premium=False):
@@ -256,6 +385,7 @@ def build(geom, path=None, premium=False):
     # An inland site has no coastal flood, so an empty hazard / water-level raster
     # would mislead — and the premium water-level layer must never be sold empty.
     premium_delivered = False
+    wse_meta = None
     depth_res = _fetch_flood_depth(*bounds)
     if depth_res is not None:
         d_arr, d_tf, d_crs = depth_res
@@ -274,15 +404,19 @@ def build(geom, path=None, premium=False):
                 # that level as the median of (DEM30 + depth) over the wet cells, then re-derive
                 # inundation against the 30 m terrain. This removes the non-physical "bumpy"
                 # surface a raw add produces and yields a 30 m-consistent extent + depth.
-                wse_wet = (dem_grid + depth)[wet]
-                if wse_wet.size:
-                    level = float(np.median(wse_wet))
+                # Level from the deepest decile, not the median over all wet cells: the
+                # coarse (~1 km, NASADEM-based) depth added to a 30 m DEM inherits the
+                # terrain's variance, which made the median track topography instead of the
+                # flood and non-monotonic in return period. See _still_water_level().
+                level, level_spread = _still_water_level(dem_grid, depth, wet)
+                if level is not None:
                     ref = inside & (dem_grid > -1000) & np.isfinite(dem_grid) & (dem_grid < level)
                     wse = np.where(ref, level, NODATA_F).astype("float32")
                     depth_ds = np.where(ref, level - dem_grid, NODATA_F).astype("float32")
                     add("water_level_wse.tif", wse)
                     add("depth_downscaled.tif", depth_ds)
                     premium_delivered = True
+                    wse_meta = {"level_m": level, "level_spread_m": level_spread}
 
     # ── write + zip ──
     tmpdir = tempfile.mkdtemp(prefix="datapack_")
@@ -332,7 +466,7 @@ def build(geom, path=None, premium=False):
         for name in list(layers) + ["README.txt"]:
             z.write(os.path.join(tmpdir, name), name)
 
-    return zip_path, {"ok": True, "layers": produced, "skipped": skipped,
+    return zip_path, {"ok": True, "layers": produced, "skipped": skipped, "wse": wse_meta,
                       "premium": premium_delivered,                 # water-level actually delivered
                       "coastal": "flood_hazard.tif" in layers,      # site reached by coastal flood -> premium applies
                       "grid": "EPSG:4326 ~30 m" if dem_grid is not None else "EPSG:4326 ~250 m (DEM unavailable)"}

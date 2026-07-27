@@ -48,6 +48,7 @@ class Req(BaseModel):
     features: Optional[list] = None
     premium: Optional[bool] = False
     return_url: Optional[str] = None
+    size: Optional[int] = None      # /terrain render-grid resolution (clamped 32-160)
 
 
 # ── Stripe (premium water-level map) config ──────────────────────────────────
@@ -168,6 +169,18 @@ def slope(req: Req):
     res = dp.slope_percent(geom)
     if not res.get("ok"):
         raise HTTPException(status_code=422, detail=res.get("error", "slope failed"))
+    return res
+
+
+@app.post("/terrain")
+def terrain(req: Req):
+    """Polygon -> downsampled DEM grid + still-water surface levels, for the 3D view.
+    Still-water levels only; no hydrodynamics (no velocity, wave, routing or timing)."""
+    import datapack as dp
+    geom = _validated_geom(req)
+    res = dp.terrain(geom, size=int(req.size or 96))
+    if not res.get("ok"):
+        raise HTTPException(status_code=422, detail=res.get("error", "terrain failed"))
     return res
 
 
