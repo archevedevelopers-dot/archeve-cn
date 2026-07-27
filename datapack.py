@@ -41,6 +41,9 @@ MAX_DEG = float(os.environ.get("DATAPACK_MAX_DEG", "0.5"))  # ~55 km — screeni
 # Cell budget for the 10 m WorldCover read (see the Manning's-n block). ~8 M cells is
 # comfortably within the 512 MB instance once the reprojection buffers are counted.
 MAX_WORLDCOVER_CELLS = float(os.environ.get("DATAPACK_MAX_WC_CELLS", "8e6"))
+# Minimum window for reading the ~1 km coastal depth grid. Smaller windows return one or
+# two cells that are often entirely nodata, which reads as "dry" on a flooded site.
+FLOOD_WINDOW_DEG = float(os.environ.get("FLOOD_WINDOW_DEG", "0.09"))   # ~10 km
 FLOOD_API = os.environ.get("FLOOD_API", "https://archeve-flood.onrender.com")
 
 # WorldCover class -> overland-flow Manning's n (sheet flow, screening)
@@ -189,14 +192,21 @@ def _still_water_level(dem, depth, wet):
     """
     if not wet.any():
         return None, None
-    dsum = (dem + depth)[wet]
     dwet = depth[wet]
-    thr = np.percentile(dwet, 90)
-    deep = dsum[dwet >= thr]
-    if deep.size == 0:
-        return None, None
-    level = float(np.median(deep))
-    spread = float(np.percentile(dsum, 75) - np.percentile(dsum, 25))
+    demwet = dem[wet]
+    # Anchor on DEPTH, not on a transferred elevation. Deltares publishes depth relative to
+    # its OWN ~1 km terrain; that depth is the meaningful product. Adding it to a different
+    # 30 m DEM and treating the sum as an absolute elevation is ill-posed — it produced a
+    # 9.1 m "water level" on ground the local DEM puts at 0.0 m, against a published max
+    # depth of 4.5 m. Instead: take a robust depth for the wet area, and reference it to the
+    # LOW ground of the same local DEM the mesh is drawn from, so the rendered depth matches
+    # the published depth and the surface stays flat.
+    depth_rep = float(np.median(dwet[dwet >= np.percentile(dwet, 90)]))
+    ground_ref = float(np.percentile(demwet, 10))
+    level = ground_ref + depth_rep
+    # How much the local terrain varies under the flooded area — the honest indicator of how
+    # coarse the ~1 km depth is relative to the 30 m mesh, not a confidence interval.
+    spread = float(np.percentile(demwet, 75) - np.percentile(demwet, 25))
     return round(level, 3), round(spread, 3)
 
 
@@ -253,23 +263,61 @@ def terrain(geom, size=96, levels=None, pad_frac=0.6):
     grid_tf = rasterio.Affine(dem_tf.a * kx, dem_tf.b, dem_tf.c,
                               dem_tf.d, dem_tf.e * ky, dem_tf.f)
 
-    # still-water level per requested return period, on the FULL-resolution DEM
+    # ── still-water level: a REGIONAL quantity, read from a deliberately wider window ──
+    # The coastal depth grid is ~1 km. Over a parcel-sized extent it returns one or two
+    # cells, which are frequently all nodata — so sampling it at the render extent reported
+    # "dry" for sites that are demonstrably in the floodplain (measured: a 1.9 km window gave
+    # a 1x2 all-nodata grid, while the same return periods over a ~9 km window gave max
+    # depths of 4.46 m and 4.61 m). A still-water level cannot be resolved inside a single
+    # cell of the grid that defines it. So: take the LEVEL from a window large enough to
+    # contain real cells, then apply it to the local 30 m terrain — extent and depth stay
+    # local, only the water-surface elevation is regional.
+    fw = max(FLOOD_WINDOW_DEG, (bounds[2] - bounds[0]))
+    fh = max(FLOOD_WINDOW_DEG * coslat, (bounds[3] - bounds[1]))
+    fbounds = (cx - fw / 2, cy - fh / 2, cx + fw / 2, cy + fh / 2)
+    fdem, fdem_tf = _mosaic(_cop_dem_urls(*fbounds), fbounds)
+    if fdem is not None:
+        fdem = np.where(fdem.astype("float32") > -1000, fdem.astype("float32"), np.nan)
+
+    # elevations under the parcel itself, on the render grid — the anchor for water level
+    try:
+        pmask = geometry_mask([mapping(g)], out_shape=small.shape, transform=grid_tf, invert=True)
+        parcel_elev = small[pmask & np.isfinite(small)]
+    except Exception:
+        parcel_elev = np.array([], dtype="float32")
+
     water = []
     for rp, scen in levels:
-        lvl = None
-        res = _fetch_flood_depth(bounds[0], bounds[1], bounds[2], bounds[3], rp=rp, scenario=scen)
-        if res is not None:
+        entry = {"rp": rp, "scenario": scen, "level_m": None,
+                 "level_spread_m": None, "max_depth_m": None}
+        res = _fetch_flood_depth(fbounds[0], fbounds[1], fbounds[2], fbounds[3],
+                                 rp=rp, scenario=scen)
+        if res is not None and fdem is not None:
             d_arr, d_tf, d_crs = res
-            depth = _reproject_to(d_arr, d_tf, d_crs, dem_tf, dem.shape, "EPSG:4326",
+            depth = _reproject_to(d_arr, d_tf, d_crs, fdem_tf, fdem.shape, "EPSG:4326",
                                   Resampling.bilinear, src_nodata=-9999.0)
-            wet = np.isfinite(depth) & (depth > 0) & np.isfinite(dem)
-            lvl, spread = _still_water_level(dem, depth, wet)
-            water.append({"rp": rp, "scenario": scen, "level_m": lvl,
-                          "level_spread_m": spread,
-                          "max_depth_m": round(float(np.nanmax(depth[wet])), 2) if wet.any() else None})
-            continue
-        water.append({"rp": rp, "scenario": scen, "level_m": None,
-                      "level_spread_m": None, "max_depth_m": None})
+            wet = np.isfinite(depth) & (depth > 0) & np.isfinite(fdem)
+            if wet.any():
+                # DEPTH comes from the wide window (the only scale at which the ~1 km grid
+                # resolves); the GROUND REFERENCE comes from the local mesh being drawn, so
+                # the rendered water depth equals the published depth on this terrain.
+                dwet = depth[wet]
+                depth_rep = float(np.median(dwet[dwet >= np.percentile(dwet, 90)]))
+                # Reference the depth to the low ground OF THE PARCEL — the site actually
+                # being screened — so the parcel floods to the published depth. Anchoring on
+                # the whole padded extent instead put the surface 4.6 m over the lowest
+                # ground where Deltares publishes 1.4 m, because the extent contained 16 m of
+                # relief that the ~1 km cell averages away.
+                ground_ref = (float(np.percentile(parcel_elev, 10)) if parcel_elev.size
+                              else (float(np.percentile(small[np.isfinite(small)], 10))
+                                    if np.isfinite(small).any() else 0.0))
+                entry["level_m"] = round(ground_ref + depth_rep, 3)
+                entry["depth_m"] = round(depth_rep, 2)
+                entry["ground_ref_m"] = round(ground_ref, 2)
+                entry["level_spread_m"] = round(float(np.percentile(parcel_elev, 75) -
+                                                      np.percentile(parcel_elev, 25)), 3) if parcel_elev.size else None
+                entry["max_depth_m"] = round(float(np.nanmax(dwet)), 2)
+        water.append(entry)
 
     valid = small[np.isfinite(small)]
     if valid.size == 0:
@@ -285,6 +333,8 @@ def terrain(geom, size=96, levels=None, pad_frac=0.6):
         "dem": [float(v) for v in out.ravel()],
         "nodata": NODATA_F,
         "dem_min": round(float(valid.min()), 2), "dem_max": round(float(valid.max()), 2),
+        "flat": bool(float(valid.max()) - float(valid.min()) < 0.5),
+        "flood_window_deg": round(fw, 4),
         "parcel": [[round(c[0], 6), round(c[1], 6)] for c in ring],
         "water": water,
         "datum": "EGM2008 orthometric (Copernicus GLO-30)",
