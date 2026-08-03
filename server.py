@@ -179,6 +179,10 @@ def demsources():
 
     Served rather than hardcoded in the client so the availability of a key-gated source is
     decided by the deployment that actually holds the key, not guessed at by the browser."""
+    # datapack is imported per-handler here, not at module scope — it drags in rasterio and
+    # every other route in this file does the same. Omitting it made this endpoint the only
+    # one referencing an undefined name, which is a 500 rather than an obvious import error.
+    import datapack as dp
     return dp.dem_sources()
 
 
