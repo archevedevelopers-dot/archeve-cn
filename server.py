@@ -49,6 +49,7 @@ class Req(BaseModel):
     premium: Optional[bool] = False
     return_url: Optional[str] = None
     size: Optional[int] = None      # /terrain render-grid resolution (clamped 32-160)
+    source: Optional[str] = None    # /terrain elevation source id (see /demsources)
 
 
 # ── Stripe (premium water-level map) config ──────────────────────────────────
@@ -172,13 +173,22 @@ def slope(req: Req):
     return res
 
 
+@app.get("/demsources")
+def demsources():
+    """Which elevation sources this deployment can serve, with the honest metadata for each.
+
+    Served rather than hardcoded in the client so the availability of a key-gated source is
+    decided by the deployment that actually holds the key, not guessed at by the browser."""
+    return dp.dem_sources()
+
+
 @app.post("/terrain")
 def terrain(req: Req):
     """Polygon -> downsampled DEM grid + still-water surface levels, for the 3D view.
     Still-water levels only; no hydrodynamics (no velocity, wave, routing or timing)."""
     import datapack as dp
     geom = _validated_geom(req)
-    res = dp.terrain(geom, size=int(req.size or 96))
+    res = dp.terrain(geom, size=int(req.size or 96), source=(req.source or "cop30"))
     if not res.get("ok"):
         raise HTTPException(status_code=422, detail=res.get("error", "terrain failed"))
     return res

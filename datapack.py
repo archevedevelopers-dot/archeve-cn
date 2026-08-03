@@ -22,11 +22,14 @@ import os
 import zipfile
 import tempfile
 import math
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 import traceback
 import urllib.request
 
 import numpy as np
 import rasterio
+from rasterio.io import MemoryFile
 from rasterio.mask import mask as rio_mask
 from rasterio.merge import merge as rio_merge
 from rasterio.warp import reproject, Resampling
@@ -51,14 +54,105 @@ WC_MANNING = {10: 0.40, 20: 0.40, 30: 0.35, 40: 0.35, 50: 0.02,
               60: 0.05, 70: 0.01, 80: 0.03, 90: 0.10, 95: 0.14, 100: 0.10}
 
 
-def _cop_dem_urls(w, s, e, n):
+def _cop_dem_urls(w, s, e, n, res=30):
+    """Copernicus DEM COG tiles. GLO-30 tiles are named COG_10, GLO-90 COG_30 — the number
+    is the tile's arc-second grid spacing, not the metre resolution, which trips people up."""
+    bucket = "copernicus-dem-30m" if res == 30 else "copernicus-dem-90m"
+    code = "10" if res == 30 else "30"
     urls = []
     for lat in range(int(math.floor(s)), int(math.floor(n)) + 1):
         for lon in range(int(math.floor(w)), int(math.floor(e)) + 1):
             ns, ew = ("N" if lat >= 0 else "S"), ("E" if lon >= 0 else "W")
-            tile = "Copernicus_DSM_COG_10_%s%02d_00_%s%03d_00_DEM" % (ns, abs(lat), ew, abs(lon))
-            urls.append("/vsicurl/https://copernicus-dem-30m.s3.amazonaws.com/%s/%s.tif" % (tile, tile))
+            tile = "Copernicus_DSM_COG_%s_%s%02d_00_%s%03d_00_DEM" % (code, ns, abs(lat), ew, abs(lon))
+            urls.append("/vsicurl/https://%s.s3.amazonaws.com/%s/%s.tif" % (bucket, tile, tile))
     return urls
+
+
+# ── open elevation sources the user can choose between ───────────────────────────
+#
+# Every field here is shown to the user, so every field has to be true. The accuracy
+# figures are the published LE90 vertical accuracies for each programme; they are
+# approximate and vary by terrain, which is stated rather than hidden.
+#
+# `commercial` matters because this tool produces deliverables that get sold. A dataset
+# that is free for research but not for commercial use must never appear as a plain
+# download here — that is a licensing problem for the user, not for us.
+DEM_SOURCES = {
+    "cop30": {
+        "id": "cop30", "name": "Copernicus GLO-30", "res_m": 30, "kind": "DSM",
+        "accuracy_m": 4, "coverage": "global", "epoch": "2011-2015",
+        "licence": "Free, attribution (ESA/Copernicus)", "commercial": True, "key": False,
+        "note": "Best-in-class free 30 m surface model. The default here.",
+    },
+    "cop90": {
+        "id": "cop90", "name": "Copernicus GLO-90", "res_m": 90, "kind": "DSM",
+        "accuracy_m": 4, "coverage": "global", "epoch": "2011-2015",
+        "licence": "Free, attribution (ESA/Copernicus)", "commercial": True, "key": False,
+        "note": "Same source as GLO-30, coarser grid. Useful for large catchments.",
+    },
+    "srtm": {
+        "id": "srtm", "name": "SRTM GL1", "res_m": 30, "kind": "DSM",
+        "accuracy_m": 9, "coverage": "60N-56S", "epoch": "2000",
+        "licence": "Public domain (NASA/USGS)", "commercial": True, "key": True,
+        "note": "The 2000 shuttle mission. Ages badly where terrain has changed since.",
+    },
+    "nasadem": {
+        "id": "nasadem", "name": "NASADEM", "res_m": 30, "kind": "DSM",
+        "accuracy_m": 6, "coverage": "60N-56S", "epoch": "2000 (reprocessed 2020)",
+        "licence": "Public domain (NASA)", "commercial": True, "key": True,
+        "note": "SRTM reprocessed with better voids and geolocation. Prefer over raw SRTM.",
+    },
+    "alos": {
+        "id": "alos", "name": "ALOS AW3D30", "res_m": 30, "kind": "DSM",
+        "accuracy_m": 5, "coverage": "global", "epoch": "2006-2011",
+        "licence": "Free, attribution (JAXA)", "commercial": True, "key": True,
+        "note": "JAXA. Comparable to Copernicus; a useful independent check.",
+    },
+}
+
+# OpenTopography dataset codes for the sources that come through their API
+_OT_CODE = {"srtm": "SRTMGL1", "nasadem": "NASADEM", "alos": "AW3D30"}
+_OT_URL = "https://portal.opentopography.org/API/globaldem"
+
+
+def dem_sources():
+    """The registry, with each source marked available or not from THIS deployment.
+
+    A source that needs an API key we do not have is reported unavailable with the reason,
+    rather than being hidden — the user should be able to see what the platform could offer
+    and what is missing to enable it."""
+    have_key = bool(os.environ.get("OPENTOPOGRAPHY_API_KEY"))
+    out = []
+    for src in DEM_SOURCES.values():
+        d = dict(src)
+        d["available"] = (not src["key"]) or have_key
+        d["unavailable_reason"] = None if d["available"] else \
+            "needs OPENTOPOGRAPHY_API_KEY on the service"
+        out.append(d)
+    return {"ok": True, "sources": out, "default": "cop30"}
+
+
+def _opentopo_dataset(source, w, s, e, n):
+    """Fetch a source served by OpenTopography and open it with rasterio, in memory.
+
+    Their endpoint returns a GeoTIFF for the bbox. It is not range-request friendly, so it
+    is pulled whole rather than read through /vsicurl."""
+    key = os.environ.get("OPENTOPOGRAPHY_API_KEY")
+    if not key:
+        raise RuntimeError("OPENTOPOGRAPHY_API_KEY is not set on this service")
+    code = _OT_CODE.get(source)
+    if not code:
+        raise RuntimeError("unknown OpenTopography source %r" % source)
+    qs = urlencode({"demtype": code, "south": s, "north": n, "west": w, "east": e,
+                    "outputFormat": "GTiff", "API_Key": key})
+    req = Request(_OT_URL + "?" + qs, headers={"User-Agent": "archeve-aip"})
+    with urlopen(req, timeout=90) as r:
+        body = r.read()
+    if body[:2] not in (b"II", b"MM"):
+        # the API reports errors as text/XML with a 200 in some cases
+        raise RuntimeError("OpenTopography returned no raster: %s"
+                           % body[:180].decode("utf-8", "replace"))
+    return MemoryFile(body)
 
 
 def _worldcover_urls(w, s, e, n):
@@ -210,7 +304,7 @@ def _still_water_level(dem, depth, wet):
     return round(level, 3), round(spread, 3)
 
 
-def terrain(geom, size=96, levels=None, pad_frac=0.6):
+def terrain(geom, size=96, levels=None, pad_frac=0.6, source="cop30"):
     """Downsampled DEM grid + still-water surface levels, for the 3D view.
 
     Returns a compact JSON-able payload: a `size` x `size` elevation grid over the parcel
@@ -246,9 +340,21 @@ def terrain(geom, size=96, levels=None, pad_frac=0.6):
     if (bounds[2] - bounds[0]) > MAX_DEG or (bounds[3] - bounds[1]) > MAX_DEG:
         return {"ok": False, "error": "extent too large for the 3D view"}
 
-    dem, dem_tf = _mosaic(_cop_dem_urls(*bounds), bounds)
+    src = DEM_SOURCES.get(source) or DEM_SOURCES["cop30"]
+    try:
+        if src["id"] in ("cop30", "cop90"):
+            res = 30 if src["id"] == "cop30" else 90
+            dem, dem_tf = _mosaic(_cop_dem_urls(*bounds, res=res), bounds)
+        else:
+            mf = _opentopo_dataset(src["id"], *bounds)
+            with mf.open() as ds:
+                dem, dem_tf = ds.read(1), ds.transform
+    except Exception as ex:
+        # name the source that failed: "DEM unavailable" on a five-source picker tells
+        # the user nothing about which one to try instead
+        return {"ok": False, "error": "%s unavailable: %s" % (src["name"], ex)}
     if dem is None:
-        return {"ok": False, "error": "DEM unavailable for this extent"}
+        return {"ok": False, "error": "%s has no coverage for this extent" % src["name"]}
     dem = np.where(dem.astype("float32") > -1000, dem.astype("float32"), np.nan)
 
     # block-mean down to the render grid (keeps it small on the wire and smooths the
@@ -327,6 +433,10 @@ def terrain(geom, size=96, levels=None, pad_frac=0.6):
     ring = list(g.exterior.coords) if g.geom_type == "Polygon" else []
     return {
         "ok": True,
+        # which source actually produced this grid — the client must never have to assume
+        "dem_source": {"id": src["id"], "name": src["name"], "res_m": src["res_m"],
+                       "kind": src["kind"], "accuracy_m": src["accuracy_m"],
+                       "licence": src["licence"]},
         "width": int(Wc), "height": int(Hc),
         "bounds": [round(b, 6) for b in bounds],
         "cell_deg": [abs(grid_tf.a), abs(grid_tf.e)],
