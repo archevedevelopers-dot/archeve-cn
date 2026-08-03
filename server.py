@@ -203,8 +203,13 @@ def _verify_token(auth_header):
 # about its limit: it resets on restart and is not shared across replicas. Cheap endpoints
 # cost 1, endpoints that mosaic rasters or build archives cost more.
 _BUCKETS = {}
-_RATE_CAPACITY = 60.0                  # burst
-_RATE_REFILL = 30.0 / 60.0             # 30 units per minute sustained
+# Sized against real sessions, not a guess: a screening costs 11 (gcn 3 + slope 3 +
+# terrain 5), a flood map or a 3D view 5 each, and the DEM comparison fires five terrain
+# calls at once for 25. The first numbers here would have 429'd a user who simply compared
+# sources twice — and an office behind one NAT shares a bucket, so the burst has to absorb
+# several people working at once.
+_RATE_CAPACITY = 150.0                 # burst: ~6 comparisons or ~13 screenings
+_RATE_REFILL = 60.0 / 60.0             # 60 units per minute sustained
 
 
 def _rate_ok(ip, cost):
@@ -222,9 +227,20 @@ def _rate_ok(ip, cost):
 
 
 def _client_ip(request):
+    """The address the platform proxy actually observed.
+
+    X-Forwarded-For is "client, proxy1, proxy2 ...": each hop APPENDS what it saw, so the
+    leftmost entry is whatever the caller claimed and is fully attacker-controlled. Reading
+    it — which this did — let anyone mint a fresh rate-limit bucket per request simply by
+    varying a header, which defeats the limiter entirely.
+
+    The rightmost entry is the one our own proxy appended, so it is the last value the
+    caller could not choose. Fall back to the socket peer when the header is absent."""
     fwd = request.headers.get("x-forwarded-for", "")
-    return (fwd.split(",")[0].strip() if fwd else None) or \
-        (request.client.host if request.client else "unknown")
+    parts = [p.strip() for p in fwd.split(",") if p.strip()]
+    if parts:
+        return parts[-1]
+    return request.client.host if request.client else "unknown"
 
 
 def _charge(request, cost):
@@ -313,7 +329,7 @@ def slope(req: Req, _guard: bool = Depends(guard(3))):
 
 
 @app.get("/demsources")
-def demsources():
+def demsources(request: Request, _meter: bool = Depends(meter(1))):
     """Which elevation sources this deployment can serve, with the honest metadata for each.
 
     Served rather than hardcoded in the client so the availability of a key-gated source is
@@ -421,7 +437,8 @@ def datapack_checkout(req: Req, _guard: bool = Depends(guard(5))):
 
 
 @app.get("/datapack/premium")
-def datapack_premium(token: str, session_id: str):
+def datapack_premium(request: Request, token: str, session_id: str,
+                     _meter: bool = Depends(meter(3))):
     """Serve the paid water-level pack — only after Stripe confirms the session is paid."""
     import json
     from fastapi.responses import FileResponse

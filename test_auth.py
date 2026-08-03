@@ -55,8 +55,10 @@ ck("once the secret is set, an anonymous request is refused",
 server._BUCKETS.clear()
 ck("allows a normal burst", all(server._rate_ok("1.2.3.4", 5) for _ in range(12)))
 server._BUCKETS.clear()
+# 10 x 15 exactly equalled the raised capacity, so this stopped being able to fail when
+# the limits were retuned. Sized well past the burst so it tests the limiter, not the number.
 ck("stops a flood of expensive calls",
-   any(not server._rate_ok("5.6.7.8", 15) for _ in range(10)))
+   any(not server._rate_ok("5.6.7.8", 15) for _ in range(30)))
 server._BUCKETS.clear()
 ck("meters each client separately",
    all(server._rate_ok("a", 15) for _ in range(4)) and server._rate_ok("b", 15))
@@ -120,6 +122,45 @@ ck("a minted token verifies against this same service",
                  str(int(time.time()) + 600).encode(), hashlib.sha256).hexdigest())) is None)
 ck("an unconfigured service reports it rather than minting a rejected token",
    'reason": "not_configured' in src0 or "'not_configured'" in src0 or 'not_configured' in src0)
+
+# ── client identity cannot be forged ──
+class _Req:
+    def __init__(self, xff=None, peer="10.0.0.1"):
+        self.headers = {"x-forwarded-for": xff} if xff else {}
+        self.client = type("c", (), {"host": peer})()
+
+ck("uses the proxy-observed address, not the caller's claim",
+   server._client_ip(_Req("1.2.3.4, 203.0.113.9")) == "203.0.113.9")
+ck("a forged X-Forwarded-For cannot mint a fresh bucket",
+   len({server._client_ip(_Req("%d.%d.%d.%d, 203.0.113.9" % (i, i, i, i)))
+        for i in range(1, 20)}) == 1)
+ck("falls back to the socket peer with no header",
+   server._client_ip(_Req(None, "198.51.100.7")) == "198.51.100.7")
+ck("handles a single-entry header",
+   server._client_ip(_Req("203.0.113.9")) == "203.0.113.9")
+ck("ignores empty segments",
+   server._client_ip(_Req("1.1.1.1, , 203.0.113.9")) == "203.0.113.9")
+
+# ── the limits fit real sessions ──
+SCREEN, FLOOD, VIEW3D, COMPARE = 11, 5, 5, 25
+server._BUCKETS.clear()
+ck("a full working session is not rate limited",
+   all(server._rate_ok("realuser", c)
+       for c in [SCREEN, FLOOD, VIEW3D, COMPARE, SCREEN, FLOOD, COMPARE]))
+server._BUCKETS.clear()
+ck("several people behind one office NAT can work at once",
+   all(server._rate_ok("office-nat", SCREEN) for _ in range(10)))
+server._BUCKETS.clear()
+ck("a scripted flood is still stopped",
+   any(not server._rate_ok("scraper", COMPARE) for _ in range(40)))
+
+# ── endpoints that cost money are metered even when not token-gated ──
+src1 = open("server.py").read()
+ck("/datapack/premium is metered (it calls the Stripe API on every hit)",
+   "def datapack_premium(request: Request, token: str, session_id: str," in src1
+   and "Depends(meter(" in src1)
+ck("/demsources is metered", "def demsources(request: Request, _meter" in src1)
+ck("/health stays free for uptime checks", "def health(request" not in src1)
 
 # ── the guard is actually applied to the expensive endpoints ──
 src = open("server.py").read()
