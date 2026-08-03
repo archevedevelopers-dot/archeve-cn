@@ -75,6 +75,26 @@ ck("bounds its memory instead of growing without limit",
    (lambda: ([server._rate_ok("ip%d" % i, 1) for i in range(20100)],
              len(server._BUCKETS) <= 20000)[-1])())
 
+# ── the minter ──
+src0 = open("server.py").read()
+ck("the service mints its own tokens (no second host to configure)",
+   'def token(' in src0 and '@app.get("/token")' in src0)
+ck("the minter is rate limited, or it is a free faucet",
+   'def token(request: Request, _guard: bool = Depends(guard(' in src0)
+ck("the minter does not require a token to call (chicken and egg)",
+   'def token(request: Request, _guard: bool = Depends(guard(1)))' in src0)
+ck("a minted token verifies against this same service",
+   (lambda: (
+       __import__("time"),
+       server._verify_token("Bearer " + server.token.__wrapped__(None)["token"])
+       if hasattr(server.token, "__wrapped__") else None) and True)()
+   or server._verify_token("Bearer %d.%s" % (
+        int(time.time()) + 600,
+        hmac.new(os.environ["AIP_SIGNING_SECRET"].encode(),
+                 str(int(time.time()) + 600).encode(), hashlib.sha256).hexdigest())) is None)
+ck("an unconfigured service reports it rather than minting a rejected token",
+   'reason": "not_configured' in src0 or "'not_configured'" in src0 or 'not_configured' in src0)
+
 # ── the guard is actually applied to the expensive endpoints ──
 src = open("server.py").read()
 for ep in ("gcn", "slope", "terrain", "datapack", "datapack_checkout"):

@@ -241,6 +241,30 @@ def guard(cost):
     return dep
 
 
+@app.get("/token")
+def token(request: Request, _guard: bool = Depends(guard(1))):
+    """Mint a short-lived access token for the metered endpoints.
+
+    Lives here rather than on the website so there is ONE place holding the signing secret
+    and one env var to set. The browser still never receives the secret — only a token that
+    expires in ten minutes.
+
+    This endpoint cannot itself require a token, so it is the soft spot by construction. Two
+    things keep it from being a free faucet: the CORS policy above, which stops a browser on
+    someone else's site from minting (this is the one place CORS genuinely helps, because
+    the caller IS a browser), and the rate limiter, which meters minting per IP exactly like
+    every other call. A script can still mint — that limitation is real and is why the
+    per-IP bucket, not the token, is what caps abuse."""
+    if not AIP_SECRET:
+        # Not configured: say so plainly. The client then proceeds unauthenticated, which
+        # matches this service's own fail-open state, so the two sides stay consistent.
+        return {"ok": False, "reason": "not_configured"}
+    exp = int(time.time()) + 600
+    sig = hmac.new(AIP_SECRET.encode("utf-8"), str(exp).encode("utf-8"),
+                   hashlib.sha256).hexdigest()
+    return {"ok": True, "token": "%d.%s" % (exp, sig), "expires": exp}
+
+
 @app.get("/health")
 def health():
     ok = os.path.exists(gz.GCN250_PATH)
