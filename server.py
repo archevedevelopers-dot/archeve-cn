@@ -301,10 +301,26 @@ def token(request: Request, _meter: bool = Depends(meter(1))):
 
 @app.get("/health")
 def health():
+    """Liveness, plus WHICH BUILD is answering.
+
+    Three times running, the question "is the fix live?" had to be inferred from behaviour,
+    and once that inference was wrong. Nothing in the response distinguished one commit
+    from the next. Render exposes the deployed commit in the environment, so report it:
+    a deploy is then a fact to read rather than a thing to deduce from side effects.
+
+    `auth` reports whether the signing secret is present, so the fail-open rollout state is
+    likewise visible instead of guessed."""
     ok = os.path.exists(gz.GCN250_PATH)
+    commit = (os.environ.get("RENDER_GIT_COMMIT")
+              or os.environ.get("SOURCE_VERSION") or "")
     return {"status": "ok" if ok else "fetching_raster",
             "gcn250_path": gz.GCN250_PATH, "raster_present": ok,
-            "gcn250_url": gz.GCN250_URL or None}
+            "gcn250_url": gz.GCN250_URL or None,
+            "commit": commit[:8] or "unknown",
+            "auth": "enforcing" if AIP_SECRET else "open",
+            # the control that actually caps abuse, and how it identifies a client
+            "rate_limit": {"burst": _RATE_CAPACITY, "per_min": _RATE_REFILL * 60,
+                           "client_id": "xff-rightmost"}}
 
 
 @app.post("/gcn")

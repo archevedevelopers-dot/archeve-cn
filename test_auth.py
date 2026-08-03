@@ -161,6 +161,11 @@ ck("/datapack/premium is metered (it calls the Stripe API on every hit)",
    and "Depends(meter(" in src1)
 ck("/demsources is metered", "def demsources(request: Request, _meter" in src1)
 ck("/health stays free for uptime checks", "def health(request" not in src1)
+ck("/health reports which build is answering, so a deploy is a fact not a deduction",
+   'RENDER_GIT_COMMIT' in src1 and '"commit"' in src1)
+ck("/health reports whether auth is enforcing", '"auth": "enforcing" if AIP_SECRET' in src1)
+ck("/health reports how a client is identified, since that is the bypass that mattered",
+   'xff-rightmost' in src1)
 
 # ── the guard is actually applied to the expensive endpoints ──
 src = open("server.py").read()
