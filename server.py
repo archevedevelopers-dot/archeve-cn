@@ -227,22 +227,40 @@ def _client_ip(request):
         (request.client.host if request.client else "unknown")
 
 
+def _charge(request, cost):
+    if not _rate_ok(_client_ip(request), cost):
+        raise HTTPException(status_code=429,
+                            detail="Rate limit reached. This service is metered; "
+                                   "slow down or get in touch for an API allowance.")
+
+
 def guard(cost):
-    """FastAPI dependency: verify the token, then charge the rate limiter."""
+    """Verify the token, then charge the rate limiter. For the metered endpoints."""
     def dep(request: Request):
         reason = _verify_token(request.headers.get("authorization"))
         if reason:
             raise HTTPException(status_code=401, detail="Not authorised: %s." % reason)
-        if not _rate_ok(_client_ip(request), cost):
-            raise HTTPException(status_code=429,
-                                detail="Rate limit reached. This service is metered; "
-                                       "slow down or get in touch for an API allowance.")
+        _charge(request, cost)
+        return True
+    return dep
+
+
+def meter(cost):
+    """Rate limit only, no token required.
+
+    For /token itself, which cannot demand the thing it exists to issue. Using `guard` here
+    made the minter require a token to mint a token: the service returned 401 to every
+    client and the app could not authenticate at all. Metering without auth is the whole
+    point of this dependency — it is the soft spot by construction, and the bucket is what
+    stops it being a free faucet."""
+    def dep(request: Request):
+        _charge(request, cost)
         return True
     return dep
 
 
 @app.get("/token")
-def token(request: Request, _guard: bool = Depends(guard(1))):
+def token(request: Request, _meter: bool = Depends(meter(1))):
     """Mint a short-lived access token for the metered endpoints.
 
     Lives here rather than on the website so there is ONE place holding the signing secret

@@ -80,9 +80,35 @@ src0 = open("server.py").read()
 ck("the service mints its own tokens (no second host to configure)",
    'def token(' in src0 and '@app.get("/token")' in src0)
 ck("the minter is rate limited, or it is a free faucet",
-   'def token(request: Request, _guard: bool = Depends(guard(' in src0)
-ck("the minter does not require a token to call (chicken and egg)",
-   'def token(request: Request, _guard: bool = Depends(guard(1)))' in src0)
+   'def token(request: Request, _meter: bool = Depends(meter(' in src0)
+
+# The previous version of this check asserted the presence of `guard` and CALLED that
+# "does not require a token" — certifying the exact bug it was meant to prevent. The
+# minter shipped requiring a token to mint a token and returned 401 to every client.
+# Test the BEHAVIOUR through the dependency, not the shape of the source.
+def _call(dep, auth=None, ip="9.9.9.9"):
+    class _R:
+        headers = {"authorization": auth} if auth else {}
+        class client: host = ip
+    try:
+        return dep(_R())
+    except Exception as ex:
+        return getattr(ex, "status_code", "err")
+
+server._BUCKETS.clear()
+ck("MINTER is reachable with no token at all (the chicken-and-egg bug)",
+   _call(server.meter(1)) is True)
+ck("minter still meters: a flood of minting is refused",
+   (lambda: ([_call(server.meter(15), ip="7.7.7.7") for _ in range(10)],
+             _call(server.meter(15), ip="7.7.7.7") == 429)[-1])())
+server._BUCKETS.clear()
+ck("METERED endpoints do still refuse an anonymous call",
+   _call(server.guard(1)) == 401)
+ck("metered endpoints accept a valid token",
+   _call(server.guard(1), auth=tok(now + 300)) is True)
+ck("guard and meter are genuinely different dependencies",
+   'def guard(' in src0 and 'def meter(' in src0
+   and 'def token(request: Request, _guard' not in src0)
 ck("a minted token verifies against this same service",
    (lambda: (
        __import__("time"),
