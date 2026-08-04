@@ -323,6 +323,26 @@ def health():
                            "client_id": "xff-rightmost"}}
 
 
+@app.get("/whoami")
+def whoami(request: Request, _guard: bool = Depends(guard(0))):
+    """What the rate limiter actually keys on, as the service sees it.
+
+    Written because a 250-request burst against a 150-token bucket produced zero 429s:
+    the limiter was not limiting, and the reason could not be established from outside.
+    Guessing the proxy chain is what produced the broken key in the first place, so this
+    reports the real one. Token-gated so the chain is not public, and costed at 0 so it
+    can be polled while the limiter itself is under test."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    parts = [p.strip() for p in fwd.split(",") if p.strip()]
+    watch = ("x-real-ip", "true-client-ip", "cf-connecting-ip", "x-client-ip", "forwarded")
+    return {"xff": parts,
+            "xff_count": len(parts),
+            "socket_peer": request.client.host if request.client else None,
+            "derived_key": _client_ip(request),
+            "other_ip_headers": {k: v for k, v in request.headers.items()
+                                 if k.lower() in watch}}
+
+
 @app.post("/gcn")
 def gcn(req: Req, _guard: bool = Depends(guard(3))):
     geom = _validated_geom(req)
