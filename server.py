@@ -226,16 +226,38 @@ def _rate_ok(ip, cost):
     return True
 
 
+# Headers the edge sets itself. Order matters only in that the first present one wins.
+_EDGE_IP_HEADERS = ("cf-connecting-ip", "true-client-ip")
+
+
 def _client_ip(request):
-    """The address the platform proxy actually observed.
+    """The address the edge actually observed — measured against the live service, twice.
 
-    X-Forwarded-For is "client, proxy1, proxy2 ...": each hop APPENDS what it saw, so the
-    leftmost entry is whatever the caller claimed and is fully attacker-controlled. Reading
-    it — which this did — let anyone mint a fresh rate-limit bucket per request simply by
-    varying a header, which defeats the limiter entirely.
+    This service runs behind Cloudflare, which fronts onrender.com, so the chain arriving
+    at the app is:
 
-    The rightmost entry is the one our own proxy appended, so it is the last value the
-    caller could not choose. Fall back to the socket peer when the header is absent."""
+        client , cloudflare-edge , render-router
+
+    The LEFTMOST entry is whatever the caller typed, so keying on it let anyone mint a
+    fresh bucket per request. The RIGHTMOST entry — which this read next — is the Render
+    router, and that address is NOT stable: 10.27.203.252 and 10.31.175.104 came back
+    minutes apart, and a parallel burst fans out across more of them still. So every
+    request keyed a new bucket and the limiter never refused anything. A 250-request
+    burst against a 150-token bucket returned 250 x 200, with and without forged headers.
+
+    Cloudflare sets CF-Connecting-IP to the true client address, and rejects at the edge
+    with 403 error 1000 any request that tries to supply its own — the request never
+    reaches this process. True-Client-IP is overwritten the same way. Both were tested
+    against production. That makes them the only values here that are stable per client
+    AND outside the caller's control.
+
+    The X-Forwarded-For fallback below is the known-weak path, kept only for a direct-to-
+    origin request that never transits the edge. The global ceiling in _charge is what
+    bounds that case; this function alone is not load-bearing for abuse."""
+    for name in _EDGE_IP_HEADERS:
+        seen = (request.headers.get(name) or "").strip()
+        if seen:
+            return seen
     fwd = request.headers.get("x-forwarded-for", "")
     parts = [p.strip() for p in fwd.split(",") if p.strip()]
     if parts:
@@ -349,7 +371,7 @@ def health():
             "auth": "enforcing" if AIP_SECRET else "open",
             # the control that actually caps abuse, and how it identifies a client
             "rate_limit": {"burst": _RATE_CAPACITY, "per_min": _RATE_REFILL * 60,
-                           "client_id": "xff-rightmost",
+                           "client_id": "edge-ip",
                            "global_burst": _GLOBAL_CAPACITY,
                            "global_per_min": _GLOBAL_REFILL * 60}}
 

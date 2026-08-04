@@ -165,7 +165,36 @@ ck("/health reports which build is answering, so a deploy is a fact not a deduct
    'RENDER_GIT_COMMIT' in src1 and '"commit"' in src1)
 ck("/health reports whether auth is enforcing", '"auth": "enforcing" if AIP_SECRET' in src1)
 ck("/health reports how a client is identified, since that is the bypass that mattered",
-   'xff-rightmost' in src1)
+   '"client_id": "edge-ip"' in src1)
+
+# ── the client key: measured behaviour of the real edge, not a guess about it ──
+# Production chain is  client , cloudflare-edge , render-router.  Keying on the rightmost
+# entry keyed on the Render router, whose address changes between requests (10.27.203.252
+# then 10.31.175.104), so every request got a fresh bucket. Cloudflare 403s any request
+# that supplies its own CF-Connecting-IP, so the header cannot arrive forged.
+def _ip(headers, peer="10.0.0.9"):
+    class _R:
+        def __init__(s): s.headers = headers; s.client = type("c", (), {"host": peer})()
+    return server._client_ip(_R())
+
+CHAIN = "217.164.129.19, 172.71.151.187, 10.31.175.104"
+ck("keys on the edge-supplied client IP, not the rotating Render router",
+   _ip({"cf-connecting-ip": "217.164.129.19", "x-forwarded-for": CHAIN}) == "217.164.129.19")
+ck("the key is IDENTICAL when the Render router address changes between requests",
+   _ip({"cf-connecting-ip": "217.164.129.19",
+        "x-forwarded-for": "217.164.129.19, 172.71.151.187, 10.27.203.252"}, peer="10.27.203.252")
+   == _ip({"cf-connecting-ip": "217.164.129.19", "x-forwarded-for": CHAIN}, peer="10.31.175.104"))
+ck("two genuinely different clients still get different buckets",
+   _ip({"cf-connecting-ip": "217.164.129.19"}) != _ip({"cf-connecting-ip": "203.0.113.7"}))
+ck("true-client-ip is accepted as a fallback (Cloudflare overwrites it too)",
+   _ip({"true-client-ip": "217.164.129.19"}) == "217.164.129.19")
+ck("falls back to the forwarded chain when no edge header is present",
+   _ip({"x-forwarded-for": CHAIN}) == "10.31.175.104")
+ck("falls back to the socket peer when there is no chain at all",
+   _ip({}, peer="198.51.100.4") == "198.51.100.4")
+ck("a leftmost forged entry can never become the key while the edge header is present",
+   _ip({"cf-connecting-ip": "217.164.129.19",
+        "x-forwarded-for": "1.2.3.4, " + CHAIN}) == "217.164.129.19")
 
 # ── the guard is actually applied to the expensive endpoints ──
 src = open("server.py").read()
