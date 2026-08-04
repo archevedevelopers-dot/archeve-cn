@@ -243,7 +243,36 @@ def _client_ip(request):
     return request.client.host if request.client else "unknown"
 
 
+# A ceiling across every caller at once, keyed on nothing.
+#
+# The per-client bucket above is only as good as the identity it keys on, and that identity
+# comes from a proxy header. A 250-request burst against a 150-token bucket returned zero
+# 429s, so whatever key the chain yields here is not stable per client — leaving the service
+# with no working cap. This backstop cannot be spoofed, because there is nothing to spoof:
+# it counts total work regardless of who asks. It is deliberately loose enough that ordinary
+# use never meets it (600/min sustained is ~54 screenings a minute, well past what one free
+# instance can serve) and tight enough to bound the damage from a client we cannot identify.
+_GLOBAL_CAPACITY = 900.0
+_GLOBAL_REFILL = 600.0 / 60.0
+_GLOBAL = [_GLOBAL_CAPACITY, time.time()]
+
+
+def _global_ok(cost):
+    now = time.time()
+    tokens = min(_GLOBAL_CAPACITY, _GLOBAL[0] + (now - _GLOBAL[1]) * _GLOBAL_REFILL)
+    _GLOBAL[1] = now
+    if tokens < cost:
+        _GLOBAL[0] = tokens
+        return False
+    _GLOBAL[0] = tokens - cost
+    return True
+
+
 def _charge(request, cost):
+    if not _global_ok(cost):
+        raise HTTPException(status_code=429,
+                            detail="This service is at capacity right now. Please retry "
+                                   "shortly, or get in touch for a dedicated allowance.")
     if not _rate_ok(_client_ip(request), cost):
         raise HTTPException(status_code=429,
                             detail="Rate limit reached. This service is metered; "
@@ -320,7 +349,9 @@ def health():
             "auth": "enforcing" if AIP_SECRET else "open",
             # the control that actually caps abuse, and how it identifies a client
             "rate_limit": {"burst": _RATE_CAPACITY, "per_min": _RATE_REFILL * 60,
-                           "client_id": "xff-rightmost"}}
+                           "client_id": "xff-rightmost",
+                           "global_burst": _GLOBAL_CAPACITY,
+                           "global_per_min": _GLOBAL_REFILL * 60}}
 
 
 @app.get("/whoami")

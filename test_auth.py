@@ -174,6 +174,46 @@ for ep in ("gcn", "slope", "terrain", "datapack", "datapack_checkout"):
 ck("/health stays open for uptime checks", "def health(" in src and
    "def health(req: Req, _guard" not in src)
 
+# ── the global ceiling ──
+# Live evidence for these: 250 requests against a 150-token bucket returned 250 x 200,
+# both with forged X-Forwarded-For values and with none at all. The per-client algorithm
+# is fine (proved directly below); the KEY it is handed in production is not stable, so
+# the per-client layer cannot be the only cap. These check the layer that holds when
+# identity fails, because that is the situation the service is actually in.
+def _reset():
+    server._BUCKETS.clear()
+    server._GLOBAL[0] = server._GLOBAL_CAPACITY
+    server._GLOBAL[1] = time.time()
+
+_reset()
+ck("per-client bucket blocks when the key IS stable (algorithm is sound)",
+   sum(1 for _ in range(250) if server._rate_ok("stable", 1)) == int(server._RATE_CAPACITY))
+
+_reset()
+ck("a caller varying its key every request is still capped by the ceiling",
+   sum(1 for i in range(2000)
+       if _call(server.meter(1), ip="4.3.%d.%d" % (i // 250, i % 250)) is True)
+   <= server._GLOBAL_CAPACITY)
+
+_reset()
+ck("the ceiling refuses work once drained, whoever is asking",
+   (lambda: ([server._global_ok(1) for _ in range(int(server._GLOBAL_CAPACITY))],
+             server._global_ok(1) is False)[-1])())
+
+_reset()
+ck("the ceiling refills over time rather than latching shut",
+   (lambda: ([server._global_ok(1) for _ in range(int(server._GLOBAL_CAPACITY))],
+             server._GLOBAL.__setitem__(1, time.time() - 60),
+             server._global_ok(300))[-1])())
+
+_reset()
+ck("ordinary use never meets the ceiling: 20 full screenings pass",
+   all(server._global_ok(SCREEN) for _ in range(20)))
+
+_reset()
+ck("the ceiling is charged BEFORE the per-client bucket, so it cannot be skipped",
+   "_global_ok" in open("server.py").read().split("def _charge")[1].split("_rate_ok")[0])
+
 print("\nArcheve AIP service - access control")
 print("  %d passed, %d failed" % (P, F))
 sys.exit(1 if F else 0)
